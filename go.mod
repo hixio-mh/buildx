@@ -42,7 +42,7 @@ require (
 	github.com/miekg/pkcs11 v0.0.0-20190322140431-074fd7a1ed19 // indirect
 	github.com/moby/buildkit v0.7.0
 	github.com/opencontainers/go-digest v1.0.0-rc1
-	github.com/opencontainers/image-spec v1.0.1
+	github.com/opencontainers/image-spec v1.0.2
 	github.com/opencontainers/selinux v1.3.3 // indirect
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/common v0.0.0-20180518154759-7600349dcfe1 // indirect
