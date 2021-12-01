@@ -1,12 +1,19 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 
+	"github.com/containerd/containerd/platforms"
 	"github.com/docker/buildx/bake"
+	"github.com/docker/buildx/build"
+	"github.com/docker/buildx/util/confutil"
+	"github.com/docker/buildx/util/progress"
+	"github.com/docker/buildx/util/tracing"
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/docker/pkg/ioutils"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
@@ -14,23 +21,36 @@ import (
 
 type bakeOptions struct {
 	files     []string
-	printOnly bool
 	overrides []string
+	printOnly bool
 	commonOptions
 }
 
-func runBake(dockerCli command.Cli, targets []string, in bakeOptions) error {
+func runBake(dockerCli command.Cli, targets []string, in bakeOptions) (err error) {
 	ctx := appcontext.Context()
 
-	if len(in.files) == 0 {
-		files, err := defaultFiles()
-		if err != nil {
-			return err
+	ctx, end, err := tracing.TraceCurrentCommand(ctx, "bake")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		end(err)
+	}()
+
+	var url string
+	cmdContext := "cwd://"
+
+	if len(targets) > 0 {
+		if bake.IsRemoteURL(targets[0]) {
+			url = targets[0]
+			targets = targets[1:]
+			if len(targets) > 0 {
+				if bake.IsRemoteURL(targets[0]) {
+					cmdContext = targets[0]
+					targets = targets[1:]
+				}
+			}
 		}
-		if len(files) == 0 {
-			return errors.Errorf("no docker-compose.yml or docker-bake.hcl found, specify build file with -f/--file")
-		}
-		in.files = files
 	}
 
 	if len(targets) == 0 {
@@ -42,7 +62,7 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions) error {
 		if in.exportLoad {
 			return errors.Errorf("push and load may not be set together at the moment")
 		}
-		overrides = append(overrides, "*.output=type=registry")
+		overrides = append(overrides, "*.push=true")
 	} else if in.exportLoad {
 		overrides = append(overrides, "*.output=type=docker")
 	}
@@ -52,14 +72,73 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions) error {
 	if in.pull != nil {
 		overrides = append(overrides, fmt.Sprintf("*.pull=%t", *in.pull))
 	}
+	contextPathHash, _ := os.Getwd()
 
-	m, err := bake.ReadTargets(ctx, in.files, targets, overrides)
+	ctx2, cancel := context.WithCancel(context.TODO())
+	defer cancel()
+	printer := progress.NewPrinter(ctx2, os.Stderr, in.progress)
+
+	defer func() {
+		if printer != nil {
+			err1 := printer.Wait()
+			if err == nil {
+				err = err1
+			}
+		}
+	}()
+
+	dis, err := getInstanceOrDefault(ctx, dockerCli, in.builder, contextPathHash)
+	if err != nil {
+		return err
+	}
+
+	var files []bake.File
+	var inp *bake.Input
+
+	if url != "" {
+		files, inp, err = bake.ReadRemoteFiles(ctx, dis, url, in.files, printer)
+	} else {
+		files, err = bake.ReadLocalFiles(in.files)
+	}
+	if err != nil {
+		return err
+	}
+
+	tgts, grps, err := bake.ReadTargets(ctx, files, targets, overrides, map[string]string{
+		// Don't forget to update documentation if you add a new
+		// built-in variable: docs/reference/buildx_bake.md#built-in-variables
+		"BAKE_CMD_CONTEXT":    cmdContext,
+		"BAKE_LOCAL_PLATFORM": platforms.DefaultString(),
+	})
+	if err != nil {
+		return err
+	}
+
+	// this function can update target context string from the input so call before printOnly check
+	bo, err := bake.TargetsToBuildOpt(tgts, inp)
 	if err != nil {
 		return err
 	}
 
 	if in.printOnly {
-		dt, err := json.MarshalIndent(map[string]map[string]*bake.Target{"target": m}, "", "   ")
+		var defg map[string]*bake.Group
+		if len(grps) == 1 {
+			defg = map[string]*bake.Group{
+				"default": grps[0],
+			}
+		}
+		dt, err := json.MarshalIndent(struct {
+			Group  map[string]*bake.Group  `json:"group,omitempty"`
+			Target map[string]*bake.Target `json:"target"`
+		}{
+			defg,
+			tgts,
+		}, "", "  ")
+		if err != nil {
+			return err
+		}
+		err = printer.Wait()
+		printer = nil
 		if err != nil {
 			return err
 		}
@@ -67,36 +146,26 @@ func runBake(dockerCli command.Cli, targets []string, in bakeOptions) error {
 		return nil
 	}
 
-	bo, err := bake.TargetsToBuildOpt(m)
+	resp, err := build.Build(ctx, dis, bo, dockerAPI(dockerCli), confutil.ConfigDir(dockerCli), printer)
 	if err != nil {
 		return err
 	}
 
-	contextPathHash, _ := os.Getwd()
-
-	return buildTargets(ctx, dockerCli, bo, in.progress, contextPathHash, in.builder)
-}
-
-func defaultFiles() ([]string, error) {
-	fns := []string{
-		"docker-compose.yml",  // support app
-		"docker-compose.yaml", // support app
-		"docker-bake.json",
-		"docker-bake.override.json",
-		"docker-bake.hcl",
-		"docker-bake.override.hcl",
-	}
-	out := make([]string, 0, len(fns))
-	for _, f := range fns {
-		if _, err := os.Stat(f); err != nil {
-			if os.IsNotExist(errors.Cause(err)) {
-				continue
-			}
-			return nil, err
+	if len(in.metadataFile) > 0 && resp != nil {
+		mdata := map[string]map[string]string{}
+		for k, r := range resp {
+			mdata[k] = r.ExporterResponse
 		}
-		out = append(out, f)
+		mdatab, err := json.MarshalIndent(mdata, "", "  ")
+		if err != nil {
+			return err
+		}
+		if err := ioutils.AtomicWriteFile(in.metadataFile, mdatab, 0644); err != nil {
+			return err
+		}
 	}
-	return out, nil
+
+	return err
 }
 
 func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
@@ -114,6 +183,7 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 			if !cmd.Flags().Lookup("pull").Changed {
 				options.pull = nil
 			}
+			options.commonOptions.builder = rootOpts.builder
 			return runBake(dockerCli, args, options)
 		},
 	}
@@ -121,10 +191,10 @@ func bakeCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	flags := cmd.Flags()
 
 	flags.StringArrayVarP(&options.files, "file", "f", []string{}, "Build definition file")
+	flags.BoolVar(&options.exportLoad, "load", false, `Shorthand for "--set=*.output=type=docker"`)
 	flags.BoolVar(&options.printOnly, "print", false, "Print the options without building")
-	flags.StringArrayVar(&options.overrides, "set", nil, "Override target value (eg: targetpattern.key=value)")
-	flags.BoolVar(&options.exportPush, "push", false, "Shorthand for --set=*.output=type=registry")
-	flags.BoolVar(&options.exportLoad, "load", false, "Shorthand for --set=*.output=type=docker")
+	flags.BoolVar(&options.exportPush, "push", false, `Shorthand for "--set=*.output=type=registry"`)
+	flags.StringArrayVar(&options.overrides, "set", nil, `Override target value (e.g., "targetpattern.key=value")`)
 
 	commonBuildFlags(&options.commonOptions, flags)
 

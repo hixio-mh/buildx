@@ -4,16 +4,22 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/driver/kubernetes/execconn"
+	"github.com/docker/buildx/driver/kubernetes/manifest"
 	"github.com/docker/buildx/driver/kubernetes/podchooser"
 	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/buildx/util/progress"
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/util/tracing/detect"
 	"github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	clientappsv1 "k8s.io/client-go/kubernetes/typed/apps/v1"
@@ -35,18 +41,45 @@ type Driver struct {
 	factory          driver.Factory
 	minReplicas      int
 	deployment       *appsv1.Deployment
+	configMaps       []*corev1.ConfigMap
 	clientset        *kubernetes.Clientset
 	deploymentClient clientappsv1.DeploymentInterface
 	podClient        clientcorev1.PodInterface
+	configMapClient  clientcorev1.ConfigMapInterface
 	podChooser       podchooser.PodChooser
+}
+
+func (d *Driver) IsMobyDriver() bool {
+	return false
+}
+
+func (d *Driver) Config() driver.InitConfig {
+	return d.InitConfig
 }
 
 func (d *Driver) Bootstrap(ctx context.Context, l progress.Logger) error {
 	return progress.Wrap("[internal] booting buildkit", l, func(sub progress.SubLogger) error {
-		_, err := d.deploymentClient.Get(d.deployment.Name, metav1.GetOptions{})
+		_, err := d.deploymentClient.Get(ctx, d.deployment.Name, metav1.GetOptions{})
 		if err != nil {
-			// TODO: return err if err != ErrNotFound
-			_, err = d.deploymentClient.Create(d.deployment)
+			if !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "error for bootstrap %q", d.deployment.Name)
+			}
+
+			for _, cfg := range d.configMaps {
+				// create ConfigMap first if exists
+				_, err = d.configMapClient.Create(ctx, cfg, metav1.CreateOptions{})
+				if err != nil {
+					if !apierrors.IsAlreadyExists(err) {
+						return errors.Wrapf(err, "error while calling configMapClient.Create for %q", cfg.Name)
+					}
+					_, err = d.configMapClient.Update(ctx, cfg, metav1.UpdateOptions{})
+					if err != nil {
+						return errors.Wrapf(err, "error while calling configMapClient.Update for %q", cfg.Name)
+					}
+				}
+			}
+
+			_, err = d.deploymentClient.Create(ctx, d.deployment, metav1.CreateOptions{})
 			if err != nil {
 				return errors.Wrapf(err, "error while calling deploymentClient.Create for %q", d.deployment.Name)
 			}
@@ -69,7 +102,7 @@ func (d *Driver) wait(ctx context.Context) error {
 		depl *appsv1.Deployment
 	)
 	for try := 0; try < 100; try++ {
-		depl, err = d.deploymentClient.Get(d.deployment.Name, metav1.GetOptions{})
+		depl, err = d.deploymentClient.Get(ctx, d.deployment.Name, metav1.GetOptions{})
 		if err == nil {
 			if depl.Status.ReadyReplicas >= int32(d.minReplicas) {
 				return nil
@@ -87,7 +120,7 @@ func (d *Driver) wait(ctx context.Context) error {
 }
 
 func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
-	depl, err := d.deploymentClient.Get(d.deployment.Name, metav1.GetOptions{})
+	depl, err := d.deploymentClient.Get(ctx, d.deployment.Name, metav1.GetOptions{})
 	if err != nil {
 		// TODO: return err if err != ErrNotFound
 		return &driver.Info{
@@ -99,7 +132,7 @@ func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
 			Status: driver.Stopped,
 		}, nil
 	}
-	pods, err := podchooser.ListRunningPods(d.podClient, depl)
+	pods, err := podchooser.ListRunningPods(ctx, d.podClient, depl)
 	if err != nil {
 		return nil, err
 	}
@@ -109,6 +142,16 @@ func (d *Driver) Info(ctx context.Context) (*driver.Info, error) {
 			Name: p.Name,
 			// Other fields are unset (TODO: detect real platforms)
 		}
+
+		if p.Annotations != nil {
+			if p, ok := p.Annotations[manifest.AnnotationPlatform]; ok {
+				ps, err := platformutil.Parse(strings.Split(p, ","))
+				if err == nil {
+					node.Platforms = ps
+				}
+			}
+		}
+
 		dynNodes = append(dynNodes, node)
 	}
 	return &driver.Info{
@@ -122,9 +165,22 @@ func (d *Driver) Stop(ctx context.Context, force bool) error {
 	return nil
 }
 
-func (d *Driver) Rm(ctx context.Context, force bool) error {
-	if err := d.deploymentClient.Delete(d.deployment.Name, nil); err != nil {
-		return errors.Wrapf(err, "error while calling deploymentClient.Delete for %q", d.deployment.Name)
+func (d *Driver) Rm(ctx context.Context, force, rmVolume, rmDaemon bool) error {
+	if !rmDaemon {
+		return nil
+	}
+
+	if err := d.deploymentClient.Delete(ctx, d.deployment.Name, metav1.DeleteOptions{}); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return errors.Wrapf(err, "error while calling deploymentClient.Delete for %q", d.deployment.Name)
+		}
+	}
+	for _, cfg := range d.configMaps {
+		if err := d.configMapClient.Delete(ctx, cfg.Name, metav1.DeleteOptions{}); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return errors.Wrapf(err, "error while calling configMapClient.Delete for %q", cfg.Name)
+			}
+		}
 	}
 	return nil
 }
@@ -149,9 +205,17 @@ func (d *Driver) Client(ctx context.Context) (*client.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return client.New(ctx, "", client.WithDialer(func(string, time.Duration) (net.Conn, error) {
+
+	exp, err := detect.Exporter()
+	if err != nil {
+		return nil, err
+	}
+
+	td, _ := exp.(client.TracerDelegate)
+
+	return client.New(ctx, "", client.WithContextDialer(func(context.Context, string) (net.Conn, error) {
 		return conn, nil
-	}))
+	}), client.WithTracerDelegate(td))
 }
 
 func (d *Driver) Factory() driver.Factory {

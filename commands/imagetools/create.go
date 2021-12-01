@@ -6,6 +6,8 @@ import (
 	"io/ioutil"
 	"strings"
 
+	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/store/storeutil"
 	"github.com/docker/buildx/util/imagetools"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/distribution/reference"
@@ -18,6 +20,7 @@ import (
 )
 
 type createOptions struct {
+	builder      string
 	files        []string
 	tags         []string
 	dryrun       bool
@@ -101,9 +104,32 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 
 	ctx := appcontext.Context()
 
-	r := imagetools.New(imagetools.Opt{
-		Auth: dockerCli.ConfigFile(),
-	})
+	txn, release, err := storeutil.GetStore(dockerCli)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	var ng *store.NodeGroup
+
+	if in.builder != "" {
+		ng, err = storeutil.GetNodeGroup(txn, dockerCli, in.builder)
+		if err != nil {
+			return err
+		}
+	} else {
+		ng, err = storeutil.GetCurrentInstance(txn, dockerCli)
+		if err != nil {
+			return err
+		}
+	}
+
+	imageopt, err := storeutil.GetImageConfig(dockerCli, ng)
+	if err != nil {
+		return err
+	}
+
+	r := imagetools.New(imageopt)
 
 	if sourceRefs {
 		eg, ctx2 := errgroup.WithContext(ctx)
@@ -118,7 +144,15 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 						return err
 					}
 					srcs[i].Ref = nil
-					srcs[i].Desc = desc
+					if srcs[i].Desc.Digest == "" {
+						srcs[i].Desc = desc
+					} else {
+						var err error
+						srcs[i].Desc, err = mergeDesc(desc, srcs[i].Desc)
+						if err != nil {
+							return err
+						}
+					}
 					return nil
 				})
 			}(i)
@@ -144,9 +178,7 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 	}
 
 	// new resolver cause need new auth
-	r = imagetools.New(imagetools.Opt{
-		Auth: dockerCli.ConfigFile(),
-	})
+	r = imagetools.New(imageopt)
 
 	for _, t := range tags {
 		if err := r.Push(ctx, t, desc, dt); err != nil {
@@ -168,7 +200,7 @@ func parseSources(in []string) ([]*src, error) {
 	for i, in := range in {
 		s, err := parseSource(in)
 		if err != nil {
-			return nil, errors.Wrapf(err, "failed to parse source %q, valid sources are digests, refereces and descriptors", in)
+			return nil, errors.Wrapf(err, "failed to parse source %q, valid sources are digests, references and descriptors", in)
 		}
 		out[i] = s
 	}
@@ -216,25 +248,39 @@ func parseSource(in string) (*src, error) {
 	return &s, nil
 }
 
-func createCmd(dockerCli command.Cli) *cobra.Command {
+func createCmd(dockerCli command.Cli, opts RootOptions) *cobra.Command {
 	var options createOptions
 
 	cmd := &cobra.Command{
 		Use:   "create [OPTIONS] [SOURCE] [SOURCE...]",
 		Short: "Create a new image based on source images",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			options.builder = opts.Builder
 			return runCreate(dockerCli, options, args)
 		},
 	}
 
 	flags := cmd.Flags()
-
 	flags.StringArrayVarP(&options.files, "file", "f", []string{}, "Read source descriptor from file")
 	flags.StringArrayVarP(&options.tags, "tag", "t", []string{}, "Set reference for new image")
 	flags.BoolVar(&options.dryrun, "dry-run", false, "Show final image instead of pushing")
 	flags.BoolVar(&options.actionAppend, "append", false, "Append to existing manifest")
 
-	_ = flags
-
 	return cmd
+}
+
+func mergeDesc(d1, d2 ocispec.Descriptor) (ocispec.Descriptor, error) {
+	if d2.Size != 0 && d1.Size != d2.Size {
+		return ocispec.Descriptor{}, errors.Errorf("invalid size mismatch for %s, %d != %d", d1.Digest, d2.Size, d1.Size)
+	}
+	if d2.MediaType != "" {
+		d1.MediaType = d2.MediaType
+	}
+	if len(d2.Annotations) != 0 {
+		d1.Annotations = d2.Annotations // no merge so support removes
+	}
+	if d2.Platform != nil {
+		d1.Platform = d2.Platform // missing items filled in later from image config
+	}
+	return d1, nil
 }

@@ -8,17 +8,13 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/docker/buildx/build"
-	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/store/storeutil"
 	"github.com/docker/buildx/util/platformutil"
-	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/buildkit/util/appcontext"
-	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/spf13/cobra"
-	"golang.org/x/sync/errgroup"
 )
 
 type inspectOptions struct {
@@ -26,23 +22,10 @@ type inspectOptions struct {
 	builder   string
 }
 
-type dinfo struct {
-	di        *build.DriverInfo
-	info      *driver.Info
-	platforms []specs.Platform
-	err       error
-}
-
-type nginfo struct {
-	ng      *store.NodeGroup
-	drivers []dinfo
-	err     error
-}
-
 func runInspect(dockerCli command.Cli, in inspectOptions) error {
 	ctx := appcontext.Context()
 
-	txn, release, err := getStore(dockerCli)
+	txn, release, err := storeutil.GetStore(dockerCli)
 	if err != nil {
 		return err
 	}
@@ -51,12 +34,12 @@ func runInspect(dockerCli command.Cli, in inspectOptions) error {
 	var ng *store.NodeGroup
 
 	if in.builder != "" {
-		ng, err = getNodeGroup(txn, dockerCli, in.builder)
+		ng, err = storeutil.GetNodeGroup(txn, dockerCli, in.builder)
 		if err != nil {
 			return err
 		}
 	} else {
-		ng, err = getCurrentInstance(txn, dockerCli)
+		ng, err = storeutil.GetCurrentInstance(txn, dockerCli)
 		if err != nil {
 			return err
 		}
@@ -74,17 +57,19 @@ func runInspect(dockerCli command.Cli, in inspectOptions) error {
 
 	ngi := &nginfo{ng: ng}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	timeoutCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	err = loadNodeGroupData(timeoutCtx, dockerCli, ngi)
 
+	var bootNgi *nginfo
 	if in.bootstrap {
 		var ok bool
 		ok, err = boot(ctx, ngi)
 		if err != nil {
 			return err
 		}
+		bootNgi = ngi
 		if ok {
 			ngi = &nginfo{ng: ng}
 			err = loadNodeGroupData(ctx, dockerCli, ngi)
@@ -113,6 +98,8 @@ func runInspect(dockerCli command.Cli, in inspectOptions) error {
 				fmt.Fprintf(w, "Error:\t%s\n", err.Error())
 			} else if err := ngi.drivers[i].err; err != nil {
 				fmt.Fprintf(w, "Error:\t%s\n", err.Error())
+			} else if bootNgi != nil && len(bootNgi.drivers) > i && bootNgi.drivers[i].err != nil {
+				fmt.Fprintf(w, "Error:\t%s\n", bootNgi.drivers[i].err.Error())
 			} else {
 				fmt.Fprintf(w, "Status:\t%s\n", ngi.drivers[i].info.Status)
 				if len(n.Flags) > 0 {
@@ -145,47 +132,7 @@ func inspectCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 	}
 
 	flags := cmd.Flags()
-
 	flags.BoolVar(&options.bootstrap, "bootstrap", false, "Ensure builder has booted before inspecting")
 
-	_ = flags
-
 	return cmd
-}
-
-func boot(ctx context.Context, ngi *nginfo) (bool, error) {
-	toBoot := make([]int, 0, len(ngi.drivers))
-	for i, d := range ngi.drivers {
-		if d.err != nil || d.di.Err != nil || d.di.Driver == nil || d.info == nil {
-			continue
-		}
-		if d.info.Status != driver.Running {
-			toBoot = append(toBoot, i)
-		}
-	}
-	if len(toBoot) == 0 {
-		return false, nil
-	}
-
-	pw := progress.NewPrinter(context.TODO(), os.Stderr, "auto")
-
-	mw := progress.NewMultiWriter(pw)
-
-	eg, _ := errgroup.WithContext(ctx)
-	for _, idx := range toBoot {
-		func(idx int) {
-			eg.Go(func() error {
-				pw := mw.WithPrefix(ngi.ng.Nodes[idx].Name, len(toBoot) > 1)
-				_, err := driver.Boot(ctx, ngi.drivers[idx].di.Driver, pw)
-				if err != nil {
-					ngi.drivers[idx].err = err
-				}
-				close(pw.Status())
-				<-pw.Done()
-				return nil
-			})
-		}(idx)
-	}
-
-	return true, eg.Wait()
 }

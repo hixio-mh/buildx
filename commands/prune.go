@@ -12,11 +12,11 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/opts"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/go-units"
 	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
-	"github.com/tonistiigi/units"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -119,7 +119,7 @@ func runPrune(dockerCli command.Cli, opts pruneOptions) error {
 	<-printed
 
 	tw = tabwriter.NewWriter(os.Stdout, 1, 8, 1, '\t', 0)
-	fmt.Fprintf(tw, "Total:\t%.2f\n", units.Bytes(total))
+	fmt.Fprintf(tw, "Total:\t%s\n", units.HumanSize(float64(total)))
 	tw.Flush()
 	return nil
 }
@@ -129,18 +129,17 @@ func pruneCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "prune",
-		Short: "Remove build cache ",
+		Short: "Remove build cache",
 		Args:  cli.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options.builder = rootOpts.builder
 			return runPrune(dockerCli, options)
 		},
-		Annotations: map[string]string{"version": "1.00"},
 	}
 
 	flags := cmd.Flags()
 	flags.BoolVarP(&options.all, "all", "a", false, "Remove all unused images, not just dangling ones")
-	flags.Var(&options.filter, "filter", "Provide filter values (e.g. 'until=24h')")
+	flags.Var(&options.filter, "filter", `Provide filter values (e.g., "until=24h")`)
 	flags.Var(&options.keepStorage, "keep-storage", "Amount of disk space to keep for cache")
 	flags.BoolVar(&options.verbose, "verbose", false, "Provide a more verbose output")
 	flags.BoolVarP(&options.force, "force", "f", false, "Do not prompt for confirmation")

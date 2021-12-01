@@ -1,13 +1,19 @@
 package commands
 
 import (
+	"bytes"
+	"context"
 	"encoding/csv"
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/store/storeutil"
+	"github.com/docker/buildx/util/cobrautil"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/google/shlex"
@@ -28,6 +34,7 @@ type createOptions struct {
 	flags        string
 	configFile   string
 	driverOpts   []string
+	bootstrap    bool
 	// upgrade      bool // perform upgrade of the driver
 }
 
@@ -69,7 +76,7 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 		return errors.Errorf("failed to find driver %q", in.driver)
 	}
 
-	txn, release, err := getStore(dockerCli)
+	txn, release, err := storeutil.GetStore(dockerCli)
 	if err != nil {
 		return err
 	}
@@ -137,11 +144,24 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 				return errors.Errorf("could not create a builder instance with TLS data loaded from environment. Please use `docker context create <context-name>` to create a context for current environment and then create a builder instance with `docker buildx create <context-name>`")
 			}
 
-			ep, err = getCurrentEndpoint(dockerCli)
+			ep, err = storeutil.GetCurrentEndpoint(dockerCli)
 			if err != nil {
 				return err
 			}
 		}
+
+		if in.driver == "kubernetes" {
+			// naming endpoint to make --append works
+			ep = (&url.URL{
+				Scheme: in.driver,
+				Path:   "/" + in.name,
+				RawQuery: (&url.Values{
+					"deployment": {in.nodeName},
+					"kubeconfig": {os.Getenv("KUBECONFIG")},
+				}).Encode(),
+			}).String()
+		}
+
 		m, err := csvToMap(in.driverOpts)
 		if err != nil {
 			return err
@@ -156,11 +176,26 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 	}
 
 	if in.use && ep != "" {
-		current, err := getCurrentEndpoint(dockerCli)
+		current, err := storeutil.GetCurrentEndpoint(dockerCli)
 		if err != nil {
 			return err
 		}
 		if err := txn.SetCurrent(current, ng.Name, false, false); err != nil {
+			return err
+		}
+	}
+
+	ngi := &nginfo{ng: ng}
+
+	timeoutCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	if err = loadNodeGroupData(timeoutCtx, dockerCli, ngi); err != nil {
+		return err
+	}
+
+	if in.bootstrap {
+		if _, err = boot(ctx, ngi); err != nil {
 			return err
 		}
 	}
@@ -172,9 +207,12 @@ func runCreate(dockerCli command.Cli, in createOptions, args []string) error {
 func createCmd(dockerCli command.Cli) *cobra.Command {
 	var options createOptions
 
-	var drivers []string
-	for s := range driver.GetFactories() {
-		drivers = append(drivers, s)
+	var drivers bytes.Buffer
+	for _, d := range driver.GetFactories() {
+		if len(drivers.String()) > 0 {
+			drivers.WriteString(", ")
+		}
+		drivers.WriteString(fmt.Sprintf(`"%s"`, d.Name()))
 	}
 
 	cmd := &cobra.Command{
@@ -189,18 +227,20 @@ func createCmd(dockerCli command.Cli) *cobra.Command {
 	flags := cmd.Flags()
 
 	flags.StringVar(&options.name, "name", "", "Builder instance name")
-	flags.StringVar(&options.driver, "driver", "", fmt.Sprintf("Driver to use (available: %v)", drivers))
+	flags.StringVar(&options.driver, "driver", "", fmt.Sprintf("Driver to use (available: %s)", drivers.String()))
 	flags.StringVar(&options.nodeName, "node", "", "Create/modify node with given name")
 	flags.StringVar(&options.flags, "buildkitd-flags", "", "Flags for buildkitd daemon")
 	flags.StringVar(&options.configFile, "config", "", "BuildKit config file")
 	flags.StringArrayVar(&options.platform, "platform", []string{}, "Fixed platforms for current node")
 	flags.StringArrayVar(&options.driverOpts, "driver-opt", []string{}, "Options for the driver")
+	flags.BoolVar(&options.bootstrap, "bootstrap", false, "Boot builder after creation")
 
 	flags.BoolVar(&options.actionAppend, "append", false, "Append a node to builder instead of changing it")
 	flags.BoolVar(&options.actionLeave, "leave", false, "Remove a node from builder instead of changing it")
 	flags.BoolVar(&options.use, "use", false, "Set the current builder instance")
 
-	_ = flags
+	// hide builder persistent flag for this command
+	cobrautil.HideInheritedFlags(cmd, "builder")
 
 	return cmd
 }

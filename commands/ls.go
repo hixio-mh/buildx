@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/store/storeutil"
+	"github.com/docker/buildx/util/cobrautil"
 	"github.com/docker/buildx/util/platformutil"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
@@ -24,13 +26,13 @@ type lsOptions struct {
 func runLs(dockerCli command.Cli, in lsOptions) error {
 	ctx := appcontext.Context()
 
-	txn, release, err := getStore(dockerCli)
+	txn, release, err := storeutil.GetStore(dockerCli)
 	if err != nil {
 		return err
 	}
 	defer release()
 
-	ctx, cancel := context.WithTimeout(ctx, 7*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 
 	ll, err := txn.List()
@@ -79,7 +81,7 @@ func runLs(dockerCli command.Cli, in lsOptions) error {
 	}
 
 	currentName := "default"
-	current, err := getCurrentInstance(txn, dockerCli)
+	current, err := storeutil.GetCurrentInstance(txn, dockerCli)
 	if err != nil {
 		return err
 	}
@@ -146,6 +148,9 @@ func lsCmd(dockerCli command.Cli) *cobra.Command {
 			return runLs(dockerCli, options)
 		},
 	}
+
+	// hide builder persistent flag for this command
+	cobrautil.HideInheritedFlags(cmd, "builder")
 
 	return cmd
 }

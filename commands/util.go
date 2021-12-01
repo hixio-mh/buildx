@@ -2,71 +2,32 @@ package commands
 
 import (
 	"context"
+	"net/url"
 	"os"
-	"path/filepath"
+	"strings"
 
 	"github.com/docker/buildx/build"
 	"github.com/docker/buildx/driver"
 	"github.com/docker/buildx/store"
+	"github.com/docker/buildx/store/storeutil"
 	"github.com/docker/buildx/util/platformutil"
+	"github.com/docker/buildx/util/progress"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/context/docker"
 	"github.com/docker/cli/cli/context/kubernetes"
+	ctxstore "github.com/docker/cli/cli/context/store"
 	dopts "github.com/docker/cli/opts"
 	dockerclient "github.com/docker/docker/client"
+	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
+	"k8s.io/client-go/tools/clientcmd"
 )
-
-// getStore returns current builder instance store
-func getStore(dockerCli command.Cli) (*store.Txn, func(), error) {
-	dir := filepath.Dir(dockerCli.ConfigFile().Filename)
-	s, err := store.New(dir)
-	if err != nil {
-		return nil, nil, err
-	}
-	return s.Txn()
-}
-
-// getCurrentEndpoint returns the current default endpoint value
-func getCurrentEndpoint(dockerCli command.Cli) (string, error) {
-	name := dockerCli.CurrentContext()
-	if name != "default" {
-		return name, nil
-	}
-	de, err := getDockerEndpoint(dockerCli, name)
-	if err != nil {
-		return "", errors.Errorf("docker endpoint for %q not found", name)
-	}
-	return de, nil
-}
-
-// getDockerEndpoint returns docker endpoint string for given context
-func getDockerEndpoint(dockerCli command.Cli, name string) (string, error) {
-	list, err := dockerCli.ContextStore().List()
-	if err != nil {
-		return "", err
-	}
-	for _, l := range list {
-		if l.Name == name {
-			ep, ok := l.Endpoints["docker"]
-			if !ok {
-				return "", errors.Errorf("context %q does not have a Docker endpoint", name)
-			}
-			typed, ok := ep.(docker.EndpointMeta)
-			if !ok {
-				return "", errors.Errorf("endpoint %q is not of type EndpointMeta, %T", ep, ep)
-			}
-			return typed.Host, nil
-		}
-	}
-	return "", nil
-}
 
 // validateEndpoint validates that endpoint is either a context or a docker host
 func validateEndpoint(dockerCli command.Cli, ep string) (string, error) {
-	de, err := getDockerEndpoint(dockerCli, ep)
+	de, err := storeutil.GetDockerEndpoint(dockerCli, ep)
 	if err == nil && de != "" {
 		if ep == "default" {
 			return de, nil
@@ -78,60 +39,6 @@ func validateEndpoint(dockerCli command.Cli, ep string) (string, error) {
 		return "", errors.Wrapf(err, "failed to parse endpoint %s", ep)
 	}
 	return h, nil
-}
-
-// getCurrentInstance finds the current builder instance
-func getCurrentInstance(txn *store.Txn, dockerCli command.Cli) (*store.NodeGroup, error) {
-	ep, err := getCurrentEndpoint(dockerCli)
-	if err != nil {
-		return nil, err
-	}
-	ng, err := txn.Current(ep)
-	if err != nil {
-		return nil, err
-	}
-	if ng == nil {
-		ng, _ = getNodeGroup(txn, dockerCli, dockerCli.CurrentContext())
-	}
-
-	return ng, nil
-}
-
-// getNodeGroup returns nodegroup based on the name
-func getNodeGroup(txn *store.Txn, dockerCli command.Cli, name string) (*store.NodeGroup, error) {
-	ng, err := txn.NodeGroupByName(name)
-	if err != nil {
-		if !os.IsNotExist(errors.Cause(err)) {
-			return nil, err
-		}
-	}
-	if ng != nil {
-		return ng, nil
-	}
-
-	if name == "default" {
-		name = dockerCli.CurrentContext()
-	}
-
-	list, err := dockerCli.ContextStore().List()
-	if err != nil {
-		return nil, err
-	}
-	for _, l := range list {
-		if l.Name == name {
-			return &store.NodeGroup{
-				Name: "default",
-				Nodes: []store.Node{
-					{
-						Name:     "default",
-						Endpoint: name,
-					},
-				},
-			}, nil
-		}
-	}
-
-	return nil, errors.Errorf("no builder %q found", name)
 }
 
 // driversForNodeGroup returns drivers for a nodegroup instance
@@ -157,6 +64,10 @@ func driversForNodeGroup(ctx context.Context, dockerCli command.Cli, ng *store.N
 		}
 		ng.Driver = f.Name()
 	}
+	imageopt, err := storeutil.GetImageConfig(dockerCli, ng)
+	if err != nil {
+		return nil, err
+	}
 
 	for i, n := range ng.Nodes {
 		func(i int, n store.Node) {
@@ -177,22 +88,42 @@ func driversForNodeGroup(ctx context.Context, dockerCli command.Cli, ng *store.N
 				dockerapi.NegotiateAPIVersion(ctx)
 
 				contextStore := dockerCli.ContextStore()
-				kcc, err := kubernetes.ConfigFromContext(n.Endpoint, contextStore)
+
+				var kcc driver.KubeClientConfig
+				kcc, err = configFromContext(n.Endpoint, contextStore)
 				if err != nil {
 					// err is returned if n.Endpoint is non-context name like "unix:///var/run/docker.sock".
 					// try again with name="default".
 					// FIXME: n should retain real context name.
-					kcc, err = kubernetes.ConfigFromContext("default", contextStore)
+					kcc, err = configFromContext("default", contextStore)
 					if err != nil {
 						logrus.Error(err)
 					}
 				}
-				d, err := driver.GetDriver(ctx, "buildx_buildkit_"+n.Name, f, dockerapi, kcc, n.Flags, n.ConfigFile, n.DriverOpts, contextPathHash)
+
+				tryToUseKubeConfigInCluster := false
+				if kcc == nil {
+					tryToUseKubeConfigInCluster = true
+				} else {
+					if _, err := kcc.ClientConfig(); err != nil {
+						tryToUseKubeConfigInCluster = true
+					}
+				}
+				if tryToUseKubeConfigInCluster {
+					kccInCluster := driver.KubeClientConfigInCluster{}
+					if _, err := kccInCluster.ClientConfig(); err == nil {
+						logrus.Debug("using kube config in cluster")
+						kcc = kccInCluster
+					}
+				}
+
+				d, err := driver.GetDriver(ctx, "buildx_buildkit_"+n.Name, f, dockerapi, imageopt.Auth, kcc, n.Flags, n.Files, n.DriverOpts, n.Platforms, contextPathHash)
 				if err != nil {
 					di.Err = err
 					return nil
 				}
 				di.Driver = d
+				di.ImageOpt = imageopt
 				return nil
 			})
 		}(i, n)
@@ -203,6 +134,22 @@ func driversForNodeGroup(ctx context.Context, dockerCli command.Cli, ng *store.N
 	}
 
 	return dis, nil
+}
+
+func configFromContext(endpointName string, s ctxstore.Reader) (clientcmd.ClientConfig, error) {
+	if strings.HasPrefix(endpointName, "kubernetes://") {
+		u, _ := url.Parse(endpointName)
+		if kubeconfig := u.Query().Get("kubeconfig"); kubeconfig != "" {
+			_ = os.Setenv(clientcmd.RecommendedConfigPathEnvVar, kubeconfig)
+		}
+		rules := clientcmd.NewDefaultClientConfigLoadingRules()
+		apiConfig, err := rules.Load()
+		if err != nil {
+			return nil, err
+		}
+		return clientcmd.NewDefaultClientConfig(*apiConfig, &clientcmd.ConfigOverrides{}), nil
+	}
+	return kubernetes.ConfigFromContext(endpointName, s)
 }
 
 // clientForEndpoint returns a docker client for an endpoint
@@ -248,14 +195,33 @@ func clientForEndpoint(dockerCli command.Cli, name string) (dockerclient.APIClie
 }
 
 func getInstanceOrDefault(ctx context.Context, dockerCli command.Cli, instance, contextPathHash string) ([]build.DriverInfo, error) {
+	var defaultOnly bool
+
+	if instance == "default" && instance != dockerCli.CurrentContext() {
+		return nil, errors.Errorf("use `docker --context=default buildx` to switch to default context")
+	}
+	if instance == "default" || instance == dockerCli.CurrentContext() {
+		instance = ""
+		defaultOnly = true
+	}
+	list, err := dockerCli.ContextStore().List()
+	if err != nil {
+		return nil, err
+	}
+	for _, l := range list {
+		if l.Name == instance {
+			return nil, errors.Errorf("use `docker --context=%s buildx` to switch to context %s", instance, instance)
+		}
+	}
+
 	if instance != "" {
 		return getInstanceByName(ctx, dockerCli, instance, contextPathHash)
 	}
-	return getDefaultDrivers(ctx, dockerCli, contextPathHash)
+	return getDefaultDrivers(ctx, dockerCli, defaultOnly, contextPathHash)
 }
 
 func getInstanceByName(ctx context.Context, dockerCli command.Cli, instance, contextPathHash string) ([]build.DriverInfo, error) {
-	txn, release, err := getStore(dockerCli)
+	txn, release, err := storeutil.GetStore(dockerCli)
 	if err != nil {
 		return nil, err
 	}
@@ -269,30 +235,38 @@ func getInstanceByName(ctx context.Context, dockerCli command.Cli, instance, con
 }
 
 // getDefaultDrivers returns drivers based on current cli config
-func getDefaultDrivers(ctx context.Context, dockerCli command.Cli, contextPathHash string) ([]build.DriverInfo, error) {
-	txn, release, err := getStore(dockerCli)
+func getDefaultDrivers(ctx context.Context, dockerCli command.Cli, defaultOnly bool, contextPathHash string) ([]build.DriverInfo, error) {
+	txn, release, err := storeutil.GetStore(dockerCli)
 	if err != nil {
 		return nil, err
 	}
 	defer release()
 
-	ng, err := getCurrentInstance(txn, dockerCli)
+	if !defaultOnly {
+		ng, err := storeutil.GetCurrentInstance(txn, dockerCli)
+		if err != nil {
+			return nil, err
+		}
+
+		if ng != nil {
+			return driversForNodeGroup(ctx, dockerCli, ng, contextPathHash)
+		}
+	}
+
+	imageopt, err := storeutil.GetImageConfig(dockerCli, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	if ng != nil {
-		return driversForNodeGroup(ctx, dockerCli, ng, contextPathHash)
-	}
-
-	d, err := driver.GetDriver(ctx, "buildx_buildkit_default", nil, dockerCli.Client(), nil, nil, "", nil, contextPathHash)
+	d, err := driver.GetDriver(ctx, "buildx_buildkit_default", nil, dockerCli.Client(), imageopt.Auth, nil, nil, nil, nil, nil, contextPathHash)
 	if err != nil {
 		return nil, err
 	}
 	return []build.DriverInfo{
 		{
-			Name:   "default",
-			Driver: d,
+			Name:     "default",
+			Driver:   d,
+			ImageOpt: imageopt,
 		},
 	}, nil
 }
@@ -316,9 +290,7 @@ func loadInfoData(ctx context.Context, d *dinfo) error {
 			return errors.Wrap(err, "listing workers")
 		}
 		for _, w := range workers {
-			for _, p := range w.Platforms {
-				d.platforms = append(d.platforms, p)
-			}
+			d.platforms = append(d.platforms, w.Platforms...)
 		}
 		d.platforms = platformutil.Dedupe(d.platforms)
 	}
@@ -349,26 +321,43 @@ func loadNodeGroupData(ctx context.Context, dockerCli command.Cli, ngi *nginfo) 
 	if eg.Wait(); err != nil {
 		return err
 	}
+
+	kubernetesDriverCount := 0
+
 	for _, di := range ngi.drivers {
-		// dynamic nodes are used in Kubernetes driver.
-		// Kubernetes pods are dynamically mapped to BuildKit Nodes.
 		if di.info != nil && len(di.info.DynamicNodes) > 0 {
-			var drivers []dinfo
-			for i := 0; i < len(di.info.DynamicNodes); i++ {
-				// all []dinfo share *build.DriverInfo and *driver.Info
-				diClone := di
-				if pl := di.info.DynamicNodes[i].Platforms; len(pl) > 0 {
-					diClone.platforms = pl
-				}
-				drivers = append(drivers, di)
-			}
-			// not append (remove the static nodes in the store)
-			ngi.ng.Nodes = di.info.DynamicNodes
-			ngi.ng.Dynamic = true
-			ngi.drivers = drivers
-			return nil
+			kubernetesDriverCount++
 		}
 	}
+
+	isAllKubernetesDrivers := len(ngi.drivers) == kubernetesDriverCount
+
+	if isAllKubernetesDrivers {
+		var drivers []dinfo
+		var dynamicNodes []store.Node
+
+		for _, di := range ngi.drivers {
+			// dynamic nodes are used in Kubernetes driver.
+			// Kubernetes pods are dynamically mapped to BuildKit Nodes.
+			if di.info != nil && len(di.info.DynamicNodes) > 0 {
+				for i := 0; i < len(di.info.DynamicNodes); i++ {
+					// all []dinfo share *build.DriverInfo and *driver.Info
+					diClone := di
+					if pl := di.info.DynamicNodes[i].Platforms; len(pl) > 0 {
+						diClone.platforms = pl
+					}
+					drivers = append(drivers, di)
+				}
+				dynamicNodes = append(dynamicNodes, di.info.DynamicNodes...)
+			}
+		}
+
+		// not append (remove the static nodes in the store)
+		ngi.ng.Nodes = dynamicNodes
+		ngi.drivers = drivers
+		ngi.ng.Dynamic = true
+	}
+
 	return nil
 }
 
@@ -385,4 +374,57 @@ func (a *api) DockerAPI(name string) (dockerclient.APIClient, error) {
 		name = a.dockerCli.CurrentContext()
 	}
 	return clientForEndpoint(a.dockerCli, name)
+}
+
+type dinfo struct {
+	di        *build.DriverInfo
+	info      *driver.Info
+	platforms []specs.Platform
+	err       error
+}
+
+type nginfo struct {
+	ng      *store.NodeGroup
+	drivers []dinfo
+	err     error
+}
+
+func boot(ctx context.Context, ngi *nginfo) (bool, error) {
+	toBoot := make([]int, 0, len(ngi.drivers))
+	for i, d := range ngi.drivers {
+		if d.err != nil || d.di.Err != nil || d.di.Driver == nil || d.info == nil {
+			continue
+		}
+		if d.info.Status != driver.Running {
+			toBoot = append(toBoot, i)
+		}
+	}
+	if len(toBoot) == 0 {
+		return false, nil
+	}
+
+	printer := progress.NewPrinter(context.TODO(), os.Stderr, "auto")
+
+	baseCtx := ctx
+	eg, _ := errgroup.WithContext(ctx)
+	for _, idx := range toBoot {
+		func(idx int) {
+			eg.Go(func() error {
+				pw := progress.WithPrefix(printer, ngi.ng.Nodes[idx].Name, len(toBoot) > 1)
+				_, err := driver.Boot(ctx, baseCtx, ngi.drivers[idx].di.Driver, pw)
+				if err != nil {
+					ngi.drivers[idx].err = err
+				}
+				return nil
+			})
+		}(idx)
+	}
+
+	err := eg.Wait()
+	err1 := printer.Wait()
+	if err == nil {
+		err = err1
+	}
+
+	return true, err
 }

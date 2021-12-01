@@ -59,24 +59,33 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 	if err != nil {
 		return nil, err
 	}
+
 	d := &Driver{
 		factory:    f,
 		InitConfig: cfg,
 		clientset:  clientset,
 	}
+
 	deploymentOpt := &manifest.DeploymentOpt{
 		Name:          deploymentName,
 		Image:         bkimage.DefaultImage,
 		Replicas:      1,
 		BuildkitFlags: cfg.BuildkitFlags,
 		Rootless:      false,
+		Platforms:     cfg.Platforms,
+		ConfigFiles:   cfg.Files,
 	}
+
+	deploymentOpt.Qemu.Image = bkimage.QemuImage
+
 	loadbalance := LoadbalanceSticky
-	imageOverride := ""
+
 	for k, v := range cfg.DriverOpts {
 		switch k {
 		case "image":
-			imageOverride = v
+			if v != "" {
+				deploymentOpt.Image = v
+			}
 		case "namespace":
 			namespace = v
 		case "replicas":
@@ -84,12 +93,30 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 			if err != nil {
 				return nil, err
 			}
+		case "requests.cpu":
+			deploymentOpt.RequestsCPU = v
+		case "requests.memory":
+			deploymentOpt.RequestsMemory = v
+		case "limits.cpu":
+			deploymentOpt.LimitsCPU = v
+		case "limits.memory":
+			deploymentOpt.LimitsMemory = v
 		case "rootless":
 			deploymentOpt.Rootless, err = strconv.ParseBool(v)
 			if err != nil {
 				return nil, err
 			}
 			deploymentOpt.Image = bkimage.DefaultRootlessImage
+		case "nodeselector":
+			kvs := strings.Split(strings.Trim(v, `"`), ",")
+			s := map[string]string{}
+			for i := range kvs {
+				kv := strings.Split(kvs[i], "=")
+				if len(kv) == 2 {
+					s[kv[0]] = kv[1]
+				}
+			}
+			deploymentOpt.NodeSelector = s
 		case "loadbalance":
 			switch v {
 			case LoadbalanceSticky:
@@ -98,20 +125,31 @@ func (f *factory) New(ctx context.Context, cfg driver.InitConfig) (driver.Driver
 				return nil, errors.Errorf("invalid loadbalance %q", v)
 			}
 			loadbalance = v
+		case "qemu.install":
+			deploymentOpt.Qemu.Install, err = strconv.ParseBool(v)
+			if err != nil {
+				return nil, err
+			}
+		case "qemu.image":
+			if v != "" {
+				deploymentOpt.Qemu.Image = v
+			}
 		default:
 			return nil, errors.Errorf("invalid driver option %s for driver %s", k, DriverName)
 		}
 	}
-	if imageOverride != "" {
-		deploymentOpt.Image = imageOverride
-	}
-	d.deployment, err = manifest.NewDeployment(deploymentOpt)
+
+	d.deployment, d.configMaps, err = manifest.NewDeployment(deploymentOpt)
 	if err != nil {
 		return nil, err
 	}
+
 	d.minReplicas = deploymentOpt.Replicas
+
 	d.deploymentClient = clientset.AppsV1().Deployments(namespace)
 	d.podClient = clientset.CoreV1().Pods(namespace)
+	d.configMapClient = clientset.CoreV1().ConfigMaps(namespace)
+
 	switch loadbalance {
 	case LoadbalanceSticky:
 		d.podChooser = &podchooser.StickyPodChooser{
